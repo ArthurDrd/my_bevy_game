@@ -12,7 +12,7 @@ const ARENA_WIDTH: u32 = 10;
 const ARENA_HEIGHT: u32 = 10;
 
 const FOOD_SPAWN_TIMER: u64 = 1;
-const MOVEMENT_TIMER: u64 = 200;
+const MOVEMENT_TIMER: u64 = 150;
 
 #[derive(Component)]
 struct SnakeHead {
@@ -67,6 +67,15 @@ struct SnakeSegment;
 #[derive(Resource, Default)]
 struct SnakeSegments(Vec<Entity>);
 
+#[derive(Event)]
+struct GrowthEvent;
+
+#[derive(Resource, Default)]
+struct LastTailPosition(Option<Position>);
+
+#[derive(Event)]
+struct GameOverEvent;
+
 fn main() {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.04, 0.04, 0.04)))
@@ -80,11 +89,16 @@ fn main() {
         }))
         .add_systems(Startup, setup_camera)
         .add_systems(Startup, spawn_snake)
-        .add_systems(FixedUpdate, snake_movement.run_if(on_timer(Duration::from_millis(MOVEMENT_TIMER))))
+        .add_systems(FixedUpdate, (snake_movement.run_if(on_timer(Duration::from_millis(MOVEMENT_TIMER))), snake_eating.after(snake_movement)))
         .add_systems(FixedUpdate,food_spawner.run_if(on_timer(Duration::from_secs(FOOD_SPAWN_TIMER))))
         .add_systems(FixedUpdate, snake_movement_input.before(snake_movement))
         .add_systems(PostUpdate, (size_scaling, position_translation))
         .insert_resource(SnakeSegments::default())
+        .insert_resource(LastTailPosition::default())
+        .add_event::<GrowthEvent>()
+        .add_event::<GameOverEvent>()
+        .add_systems(Update, snake_growth.after(snake_eating))
+        .add_systems(Update, game_over.after(snake_movement))
         .run();
 }
 
@@ -111,8 +125,8 @@ fn spawn_snake(
         .insert(SnakeSegment)
         .insert(Position { x: 3, y: 3 })
         .insert(Size::square(0.8))
-        .id(), 
-    spawn_segment(commands, Position { x: 3, y: 2 }), 
+        .id(),
+    spawn_segment(commands, Position { x: 3, y: 2 }),
     ]);
 }
 
@@ -138,8 +152,19 @@ fn snake_movement_input(
     }
 }
 
-fn snake_movement(mut heads: Query<(&mut Position, &SnakeHead)>) {
-    if let Some((mut head_pos, head)) = heads.iter_mut().next() {
+fn snake_movement(
+    segments: ResMut<SnakeSegments>,
+    mut heads: Query<(Entity, &SnakeHead)>,
+    mut positions: Query<&mut Position>,
+    mut last_tail_position: ResMut<LastTailPosition>,
+    mut game_over_writer: EventWriter<GameOverEvent>,
+) {
+    if let Some((head_entity, head)) = heads.iter_mut().next() {
+        let segment_positions = segments
+            .0.iter()
+            .map(|e| *positions.get_mut(*e).unwrap())
+            .collect::<Vec<Position>>();
+        let mut head_pos = positions.get_mut(head_entity).unwrap();
         match &head.direction {
             Direction::Left => {
                 head_pos.x -= 1;
@@ -154,6 +179,26 @@ fn snake_movement(mut heads: Query<(&mut Position, &SnakeHead)>) {
                 head_pos.y -= 1;
             }
         };
+        
+        if head_pos.x < 0
+            || head_pos.y < 0
+            || head_pos.x as u32 >= ARENA_WIDTH
+            || head_pos.y as u32 >= ARENA_HEIGHT
+        {
+            game_over_writer.send(GameOverEvent);
+        }
+
+        if segment_positions.contains(&head_pos) {
+            game_over_writer.send(GameOverEvent);
+        }
+        
+        segment_positions
+            .iter()
+            .zip(segments.0.iter().skip(1))
+            .for_each(|(pos, segment)| {
+                *positions.get_mut(*segment).unwrap() = *pos;
+            });
+        *last_tail_position = LastTailPosition(Some(*segment_positions.last().unwrap()));
     }
 }
 
@@ -228,4 +273,46 @@ fn spawn_segment(
         .insert(position)
         .insert(Size::square(0.65))
         .id()
+}
+
+fn snake_eating(
+    mut commands: Commands,
+    mut growth_writer : EventWriter<GrowthEvent>,
+    food_positions: Query<(Entity, &Position), With<Food>>,
+    head_positions: Query<&Position, With<SnakeHead>>,
+) {
+    for head_pos in head_positions.iter() {
+        for (ent, food_pos) in food_positions.iter() {
+            if food_pos == head_pos {
+                commands.entity(ent).despawn();
+                growth_writer.send(GrowthEvent);
+            }
+        }
+    }
+}
+
+fn snake_growth(
+    commands: Commands,
+    last_tail_position: Res<LastTailPosition>,
+    mut segments: ResMut<SnakeSegments>,
+    mut growth_reader: EventReader<GrowthEvent>,
+) {
+    if growth_reader.read().next().is_some() {
+        segments.0.push(spawn_segment(commands, last_tail_position.0.unwrap()));
+    }
+}
+
+fn game_over(
+    mut commands: Commands,
+    mut reader: EventReader<GameOverEvent>,
+    segments_res: ResMut<SnakeSegments>,
+    food: Query<Entity, With<Food>>,
+    segments: Query<Entity, With<SnakeSegment>>,
+) {
+    if reader.read().next().is_some() {
+        for ent in food.iter().chain(segments.iter()) {
+            commands.entity(ent).despawn();
+        }
+        spawn_snake(commands, segments_res);
+    }
 }
